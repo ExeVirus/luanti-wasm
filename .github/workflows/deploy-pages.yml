@@ -1,0 +1,89 @@
+name: Build Luanti Mapgen Editor & Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      clean_build:
+        description: "Wipe build/ cache and recompile everything from scratch"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # Current GitHub Actions Ubuntu LTS (26.04 LTS)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Ensure Node.js 24+
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            wget python3 git build-essential cmake tclsh zip unzip \
+            zstd gettext patch ca-certificates ninja-build ccache
+
+      - name: Restore emsdk, sources, and build cache
+        if: ${{ !inputs.clean_build }}
+        uses: actions/cache@v6
+        with:
+          path: |
+            emsdk
+            sources
+            .stamps
+            build
+            ~/.cache/ccache
+          key: luanti-wasm-${{ runner.os }}-${{ hashFiles('*.patch', 'openssl.patch') }}-${{ github.run_id }}
+          restore-keys: |
+            luanti-wasm-${{ runner.os }}-${{ hashFiles('*.patch', 'openssl.patch') }}-
+            luanti-wasm-${{ runner.os }}-
+
+      - name: Build luanti-wasm + mapgen editor (www/)
+        env:
+          BUILD_KIND: release
+          WITH_CURL: "1"
+          ZSTD_OPTS: "--ultra -22"
+        run: |
+          chmod +x ./build_all_standalone.sh
+          if [[ "${{ inputs.clean_build }}" == "true" ]]; then
+            ./build_all_standalone.sh --clean-build
+          else
+            # Always re-run mapgen_editor -> fsroot -> www when repo scripts change
+            rm -f build/.stamps/mapgen_editor.ok build/.stamps/fsroot.ok build/.stamps/www.ok
+            ./build_all_standalone.sh
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload www/ as GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./www
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
