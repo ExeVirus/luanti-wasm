@@ -8,7 +8,7 @@ cd "$BASE_DIR"
 # Configuration & CLI flags
 # -----------------------------------------------------------------------------
 export BUILD_KIND="${BUILD_KIND:-release}"   # release | debug | profile
-WITH_CURL="${WITH_CURL:-0}"                  # 0 (matches upstream build_all.sh) | 1
+WITH_CURL="${WITH_CURL:-1}"                  # 0 (matches upstream build_all.sh) | 1
 ZSTD_OPTS="${ZSTD_OPTS:---ultra -22}"        # e.g. ZSTD_OPTS="-9" for faster dev fsroot packing
 FROM_STAGE=""
 RECONFIGURE_STAGE=""
@@ -87,6 +87,8 @@ BUILD_STAMPS="$BUILD_DIR/.stamps"
 
 if (( CLEAN_BUILD == 1 )); then
   rm -rf "$BUILD_DIR"
+  rm -rf "$BUILD_DIR" "$WWW_DIR"
+  rm -f "$SHARED_STAMPS"/cmake-probes-*.cmake
 fi
 
 mkdir -p "$SOURCES_DIR" "$BUILD_DIR" "$INSTALL_DIR" "$SHARED_STAMPS" "$BUILD_STAMPS"
@@ -183,11 +185,11 @@ Install on Ubuntu/Debian with:
 # -----------------------------------------------------------------------------
 # Stamp / invalidation / CMake probe cache helpers
 # -----------------------------------------------------------------------------
-STAGE_ORDER=(emsdk sources)
+STAGE_ORDER=(emsdk sources webshims)
 if (( WITH_CURL == 1 )); then
   STAGE_ORDER+=(openssl curl)
 fi
-STAGE_ORDER+=(zstd libarchive webshims libzip luanti fsroot xterm www)
+STAGE_ORDER+=(zstd libarchive libzip luanti fsroot xterm www)
 
 stamp_path_for() {
   case "$1" in
@@ -442,9 +444,10 @@ stage_sources() {
     getsource "https://curl.se/download/curl-7.82.0.tar.bz2" 46d9a0400a33408fd992770b04a44a7434b3036f2e8089ac28b57573d59d371f
   fi
 
-  getrepo zstd     "https://github.com/facebook/zstd.git"        f8745da6ff1ad1e7bab384bd1f9d742439278e99
-  getrepo webshims "https://github.com/paradust7/webshims.git"   70653a91c974aa2b20df09a39f858d92e663c1a7
-  getrepo luanti   "https://github.com/paradust7/luanti.git"     6f532b5ed03a6aa70091412114b5dde3d33c6f87
+  getrepo zstd          "https://github.com/facebook/zstd.git"          f8745da6ff1ad1e7bab384bd1f9d742439278e99
+  getrepo webshims      "https://github.com/paradust7/webshims.git"     70653a91c974aa2b20df09a39f858d92e663c1a7
+  getrepo luanti        "https://github.com/paradust7/luanti.git"       6f532b5ed03a6aa70091412114b5dde3d33c6f87
+  getrepo minetest_game "https://github.com/luanti-org/minetest_game.git" master
 }
 
 stage_openssl() {
@@ -623,7 +626,21 @@ stage_luanti() {
     local EMSDK_COMPILE="-sUSE_SDL=2 $EMSDK_PORTS"
     local EMSDK_CANVAS="-sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sJSPI"
     local EMSDK_MODULE="-sINCOMING_MODULE_JS_API=mainScriptUrlOrBlob,canvas,monitorRunDependencies,preRun,postRun,print,printErr,setStatus,onFullScreen"
-    local EMSDK_LINK="$EMSDK_COMPILE $EMSDK_CANVAS $EMSDK_MODULE -sPTHREAD_POOL_SIZE=22 -s EXPORTED_RUNTIME_METHODS=ccall,cwrap -s INITIAL_MEMORY=2013265920 -sMIN_WEBGL_VERSION=2 -sUSE_WEBGL2 -sWASMFS=1 -L$INSTALL_DIR/lib -larchive -lzstd -lemsocket -lwebsocket.js"
+    
+    local CURL_LINK_FLAGS=""
+    local CURL_CMAKE_FLAGS=()
+    if (( WITH_CURL == 1 )); then
+      CURL_LINK_FLAGS="-lcurl -lssl -lcrypto"
+      CURL_CMAKE_FLAGS=(
+        -DENABLE_CURL=ON
+        -DCURL_INCLUDE_DIR="$INSTALL_DIR/include"
+        -DCURL_LIBRARY="$INSTALL_DIR/lib/libcurl.a"
+      )
+    else
+      CURL_CMAKE_FLAGS=(-DENABLE_CURL=OFF)
+    fi
+
+    local EMSDK_LINK="$EMSDK_COMPILE $EMSDK_CANVAS $EMSDK_MODULE -sPTHREAD_POOL_SIZE=22 -s EXPORTED_RUNTIME_METHODS=ccall,cwrap -s INITIAL_MEMORY=2013265920 -sMIN_WEBGL_VERSION=2 -sUSE_WEBGL2 -sWASMFS=1 -L$INSTALL_DIR/lib -larchive -lzstd $CURL_LINK_FLAGS -lemsocket -lwebsocket.js"
 
     export CFLAGS="$CFLAGS $EMSDK_COMPILE"
     export CXXFLAGS="$CXXFLAGS $EMSDK_COMPILE"
@@ -655,6 +672,8 @@ stage_luanti() {
         -DRUN_IN_PLACE=TRUE \
         -DENABLE_GLES=TRUE \
         -DENABLE_UPDATE_CHECKER=0 \
+        -DINSTALL_DEVTEST=TRUE \
+        "${CURL_CMAKE_FLAGS[@]}" \
         -DFREETYPE_LIBRARY="$DUMMY_OBJECT" \
         -DPNG_LIBRARY="$DUMMY_OBJECT" \
         -DVORBISFILE_LIBRARY="$DUMMY_OBJECT" \
@@ -674,7 +693,8 @@ stage_luanti() {
 
     rm -rf "$BUILD_DIR/luanti-install"
     cmake --build . -j"$NPROC"
-    cmake --install .
+    cmake --install . --prefix "$BUILD_DIR/luanti-install"
+    rm -f "$(stamp_path_for fsroot)" "$(stamp_path_for www)"
   )
 }
 
@@ -685,22 +705,48 @@ stage_fsroot() {
     mkdir fsroot
     cp -a "luanti-install" fsroot/luanti
 
+    # Fallback: ensure minetest_game is available even if stage_sources was skipped
+    if [[ ! -d "$SOURCES_DIR/minetest_game" ]]; then
+      log "Cloning minetest_game..."
+      git clone --depth 1 https://github.com/luanti-org/minetest_game.git "$SOURCES_DIR/minetest_game"
+    fi
+
     (
       cd fsroot/luanti
       rm -rf bin unix
       mkdir -p bin cache games
       echo "This is here to ensure bin exists" > bin/readme.txt
+
+      # 1. Install minetest_game (excluding .git to keep the pack small)
+      log "Installing minetest_game into games/minetest_game..."
+      mkdir -p games/minetest_game
+      tar -C "$SOURCES_DIR/minetest_game" --exclude=".git" -cf - . | tar -C games/minetest_game -xf -
+
+      # 2. Install devtest (if present in luanti source)
+      if [[ -d "$SOURCES_DIR/luanti/games/devtest" ]]; then
+        log "Installing devtest into games/devtest..."
+        mkdir -p games/devtest
+        tar -C "$SOURCES_DIR/luanti/games/devtest" --exclude=".git" -cf - . | tar -C games/devtest -xf -
+      fi
+
+      # 3. Configure default settings for WebAssembly
       cat > cache/common.conf << 'EOF'
 update_last_checked = disabled
 no_mtg_notification = true
 no_keycode_migration_warning = true
+default_game = minetest_game
+sqlite_synchronous = 0
 EOF
     )
 
+    # Prepare SSL certificates
     rm -rf certsroot
-    mkdir -p certsroot/etc/ssl/certs
+    mkdir -p certsroot/etc/ssl/certs certsroot/ssl/certs
     cat /etc/ssl/certs/ca-certificates.crt > certsroot/etc/ssl/certs/ca-certificates.crt
+    cat /etc/ssl/certs/ca-certificates.crt > certsroot/ssl/cert.pem
+    cp certsroot/ssl/cert.pem certsroot/ssl/certs/ca-certificates.crt
 
+    # Pack archives with zstd
     rm -f fsroot.tar certs.tar fsroot.tar.zst certs.tar.zst
     tar cf fsroot.tar -C fsroot .
     tar cf certs.tar -C certsroot .
@@ -708,6 +754,9 @@ EOF
     zstd -f -T0 $ZSTD_OPTS fsroot.tar
     # shellcheck disable=SC2086
     zstd -f -T0 $ZSTD_OPTS certs.tar
+
+    # Invalidate stage_www so the new base.pack is immediately copied to www/
+    rm -f "$(stamp_path_for www)"
   )
 }
 
@@ -741,7 +790,7 @@ stage_www() {
   RELEASE_DIR="$WWW_DIR/$RELEASE_UUID"
   PACKS_DIR="$RELEASE_DIR/packs"
 
-  log "Installing release $RELEASE_UUID into www/"
+  log "Installing release $RELEASE_UUID into $WWW_DIR"
   rm -rf "$WWW_DIR"
   mkdir -p "$RELEASE_DIR" "$PACKS_DIR"
 
@@ -781,7 +830,9 @@ invalidate_stages
 
 run_stage emsdk      stage_emsdk      '[[ -f "$BASE_DIR/emsdk/emsdk_env.sh" ]]'
 activate_emsdk
-run_stage sources    stage_sources    '[[ -d "$SOURCES_DIR/luanti/.git" && -d "$SOURCES_DIR/webshims/.git" && -d "$SOURCES_DIR/zstd/.git" ]]'
+run_stage sources stage_sources '[[ -d "$SOURCES_DIR/luanti/.git" && -d "$SOURCES_DIR/minetest_game/.git" && -d "$SOURCES_DIR/webshims/.git" && -d "$SOURCES_DIR/zstd/.git" ]]'
+
+run_stage webshims   stage_webshims   '[[ -f "$INSTALL_DIR/lib/libemsocket.a" ]]'
 
 if (( WITH_CURL == 1 )); then
   run_stage openssl  stage_openssl    '[[ -f "$INSTALL_DIR/lib/libssl.a" && -f "$INSTALL_DIR/lib/libcrypto.a" ]]'
@@ -790,7 +841,6 @@ fi
 
 run_stage zstd       stage_zstd       '[[ -f "$INSTALL_DIR/lib/libzstd.a" ]]'
 run_stage libarchive stage_libarchive '[[ -f "$INSTALL_DIR/lib/libarchive.a" ]]'
-run_stage webshims   stage_webshims   '[[ -f "$INSTALL_DIR/lib/libemsocket.a" ]]'
 run_stage libzip     stage_libzip     '[[ -f "$INSTALL_DIR/lib/libzip.a" ]]'
 run_stage luanti     stage_luanti     '[[ -f "$BUILD_DIR/luanti/bin/luanti.wasm" && -d "$BUILD_DIR/luanti-install" ]]'
 run_stage fsroot     stage_fsroot     '[[ -f "$BUILD_DIR/fsroot.tar.zst" && -f "$BUILD_DIR/certs.tar.zst" ]]'
