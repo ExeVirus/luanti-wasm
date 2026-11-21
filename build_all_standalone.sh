@@ -9,16 +9,17 @@ cd "$BASE_DIR"
 # -----------------------------------------------------------------------------
 export BUILD_KIND="${BUILD_KIND:-release}"   # release | debug | profile
 WITH_CURL="${WITH_CURL:-0}"                  # 0 (matches upstream build_all.sh) | 1
+ZSTD_OPTS="${ZSTD_OPTS:---ultra -22}"        # e.g. ZSTD_OPTS="-9" for faster dev fsroot packing
 FROM_STAGE=""
 RECONFIGURE_STAGE=""
 CLEAN_BUILD=0
 
 usage() {
   cat << 'EOF'
-Usage: ./build_all.sh [options]
+Usage: ./build_all_standalone.sh [options]
 
 Options:
-  --from <stage>         Re-run from <stage> onward (keeps build caches for incremental make)
+  --from <stage>         Re-run from <stage> onward (keeps build caches for incremental builds)
   --reconfigure <stage>  Wipe build dir of <stage> and re-run from <stage> onward
   --with-curl            Also build openssl + curl (disabled in upstream build_all.sh)
   --clean-build          Remove build<suffix>/ and recompile deps+luanti (keeps emsdk & sources)
@@ -29,6 +30,7 @@ Stages (in order):
 
 Environment:
   BUILD_KIND=release|debug|profile   (default: release)
+  ZSTD_OPTS="--ultra -22"            (override e.g. ZSTD_OPTS="-9" for faster dev packs)
 EOF
 }
 
@@ -92,10 +94,15 @@ mkdir -p "$SOURCES_DIR" "$BUILD_DIR" "$INSTALL_DIR" "$SHARED_STAMPS" "$BUILD_STA
 NPROC="$(nproc 2>/dev/null || echo 4)"
 export MAKEFLAGS="-j$NPROC"
 
-export CFLAGS="$COMMON_CFLAGS -pthread -fwasm-exceptions -sJSPI"
-export CXXFLAGS="$COMMON_CFLAGS -pthread -fwasm-exceptions -sJSPI"
-export LDFLAGS="$COMMON_LDFLAGS -pthread -fwasm-exceptions -sJSPI"
+# Keep -O2/-g/-sJSPI out of global CFLAGS/LDFLAGS so CMake try_compile probes
+# run at -O0 without Binaryen wasm-opt or JSPI overhead.
+export CFLAGS="-pthread -fwasm-exceptions"
+export CXXFLAGS="-pthread -fwasm-exceptions"
+export LDFLAGS="-pthread -fwasm-exceptions"
 export LUANTI_REPO="$SOURCES_DIR/luanti"
+
+CMAKE_GENERATOR="Unix Makefiles"
+CMAKE_COMMON_FLAGS=()
 
 log()  { printf '\n\033[1;34m[build_all]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
@@ -104,7 +111,7 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 trap 'die "Command failed at line $LINENO: $BASH_COMMAND"' ERR
 
 # -----------------------------------------------------------------------------
-# Host preflight checks
+# Host preflight checks & CMake acceleration
 # -----------------------------------------------------------------------------
 check_host_tools() {
   local missing=()
@@ -118,7 +125,7 @@ check_host_tools() {
   if (( ${#missing[@]} > 0 )); then
     die "Missing required host tools: ${missing[*]}
 Install on Ubuntu/Debian with:
-  sudo apt-get update && sudo apt-get install -y wget python3 git build-essential cmake tclsh zip zstd gettext patch ca-certificates"
+  sudo apt-get update && sudo apt-get install -y wget python3 git build-essential cmake tclsh zip zstd gettext patch ca-certificates ninja-build ccache"
   fi
 
   [[ -r /etc/ssl/certs/ca-certificates.crt ]] || die "Missing /etc/ssl/certs/ca-certificates.crt (install ca-certificates)"
@@ -132,10 +139,49 @@ Install on Ubuntu/Debian with:
     die "Node.js v24+ is required (found: ${node_ver:-none} at $NODE_FULL_PATH)"
   fi
   log "Using Node.js $node_ver ($NODE_FULL_PATH)"
+
+  if command -v ninja >/dev/null 2>&1; then
+    CMAKE_GENERATOR="Ninja"
+  else
+    warn "ninja not found; using Unix Makefiles (install ninja-build for faster CMake builds)"
+  fi
+
+  if command -v ccache >/dev/null 2>&1; then
+    export EM_COMPILER_WRAPPER="ccache"
+  else
+    warn "ccache not found (install ccache to speed up rebuilds)"
+  fi
+
+  CMAKE_COMMON_FLAGS=(
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    -DCMAKE_BUILD_TYPE="$LUANTI_BUILD_TYPE"
+  )
+  if [[ "$LUANTI_BUILD_TYPE" == "Release" ]]; then
+    CMAKE_COMMON_FLAGS+=(
+      -DCMAKE_TRY_COMPILE_CONFIGURATION=Debug
+      -DCMAKE_C_FLAGS_DEBUG="-O0"
+      -DCMAKE_CXX_FLAGS_DEBUG="-O0"
+      -DCMAKE_EXE_LINKER_FLAGS_DEBUG="-O0"
+      -DCMAKE_C_FLAGS_RELEASE="$COMMON_CFLAGS -DNDEBUG"
+      -DCMAKE_CXX_FLAGS_RELEASE="$COMMON_CFLAGS -DNDEBUG"
+      -DCMAKE_EXE_LINKER_FLAGS_RELEASE="$COMMON_LDFLAGS"
+    )
+  else
+    # Debug build: force try_compile to use -O0 without -g/-gsource-map/-sSAFE_HEAP
+    CMAKE_COMMON_FLAGS+=(
+      -DCMAKE_TRY_COMPILE_CONFIGURATION=Release
+      -DCMAKE_C_FLAGS_RELEASE="-O0"
+      -DCMAKE_CXX_FLAGS_RELEASE="-O0"
+      -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-O0"
+      -DCMAKE_C_FLAGS_DEBUG="$COMMON_CFLAGS"
+      -DCMAKE_CXX_FLAGS_DEBUG="$COMMON_CFLAGS"
+      -DCMAKE_EXE_LINKER_FLAGS_DEBUG="$COMMON_LDFLAGS"
+    )
+  fi
 }
 
 # -----------------------------------------------------------------------------
-# Stamp / invalidation helpers
+# Stamp / invalidation / CMake probe cache helpers
 # -----------------------------------------------------------------------------
 STAGE_ORDER=(emsdk sources)
 if (( WITH_CURL == 1 )); then
@@ -196,9 +242,54 @@ run_stage() {
   fi
 
   log "=== Stage: $name ==="
+  local t0=$SECONDS
   "$fn"
   date -u +"%Y-%m-%dT%H:%M:%SZ" > "$stamp"
-  log "Completed '$name'"
+  log "Completed '$name' in $((SECONDS - t0))s"
+}
+
+cmake_probe_args() {
+  local stage="$1"
+  local probe_file="$SHARED_STAMPS/cmake-probes-$stage.cmake"
+  if [[ -f "$probe_file" ]]; then
+    printf '%s\n' "-C" "$probe_file"
+  fi
+}
+
+save_cmake_probes() {
+  local stage="$1"
+  local cache="$2"
+  local probe_file="$SHARED_STAMPS/cmake-probes-$stage.cmake"
+  [[ -f "$cache" && ! -f "$probe_file" ]] || return 0
+
+  python3 - "$cache" "$probe_file.tmp" << 'PY'
+import re, sys
+
+cache_path, out_path = sys.argv[1], sys.argv[2]
+internals = {}
+pat = re.compile(r'^([A-Za-z0-9_]+):INTERNAL=(.*)$')
+with open(cache_path, 'r', encoding='utf-8', errors='replace') as f:
+    for line in f:
+        m = pat.match(line.rstrip('\n'))
+        if m:
+            internals[m.group(1)] = m.group(2)
+
+prefixes = (
+    'HAVE_', 'SIZEOF_', 'CHECK_', 'CMAKE_HAVE_', 'SAFE_',
+    'STRERROR_', 'TIME_WITH_', 'MAJOR_IN_', 'ICONV_', 'POSIX_'
+)
+keep = {}
+for k, v in internals.items():
+    if (k.startswith(prefixes) or f'HAVE_{k}' in internals) and ']=]' not in v:
+        if k.startswith('CMAKE_') and not k.startswith('CMAKE_HAVE_'):
+            continue
+        keep[k] = v
+
+with open(out_path, 'w', encoding='utf-8') as out:
+    for k in sorted(keep):
+        out.write(f'set({k} [=[{keep[k]}]=] CACHE INTERNAL "")\n')
+PY
+  mv "$probe_file.tmp" "$probe_file"
 }
 
 # -----------------------------------------------------------------------------
@@ -303,6 +394,7 @@ getrepo() {
 # Stage definitions
 # -----------------------------------------------------------------------------
 stage_emsdk() {
+  rm -f "$SHARED_STAMPS"/cmake-probes-*.cmake
   rm -rf "$BASE_DIR/emsdk"
   git clone https://github.com/emscripten-core/emsdk.git "$BASE_DIR/emsdk"
 
@@ -363,9 +455,9 @@ stage_openssl() {
     "$SOURCES_DIR/webshims/src/emsocket/wrap.py" .
     patch -p1 < "$BASE_DIR/openssl.patch"
 
-    export CFLAGS="$CFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
-    export CXXFLAGS="$CXXFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
-    export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket -sDEFAULT_TO_CXX"
+    export CFLAGS="$COMMON_CFLAGS $CFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
+    export CXXFLAGS="$COMMON_CFLAGS $CXXFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
+    export LDFLAGS="$COMMON_LDFLAGS $LDFLAGS -L${INSTALL_DIR}/lib -lemsocket -sDEFAULT_TO_CXX"
 
     emconfigure ./Configure linux-generic64 \
       no-asm no-engine no-hw no-weak-ssl-ciphers no-dtls no-shared no-dso \
@@ -395,8 +487,9 @@ stage_curl() {
     export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket -sDEFAULT_TO_CXX --use-port=zlib"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args curl)
+      emcmake cmake -G "$CMAKE_GENERATOR" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
         -DCURL_ZLIB=ON \
         -DOPENSSL_SSL_LIBRARY="$INSTALL_DIR/lib/libssl.a" \
         -DOPENSSL_CRYPTO_LIBRARY="$INSTALL_DIR/lib/libcrypto.a" \
@@ -405,9 +498,10 @@ stage_curl() {
         -DBUILD_SHARED_LIBS=OFF \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         "$BUILD_DIR/curl"
+      save_cmake_probes curl CMakeCache.txt
     fi
-    emmake make -j"$NPROC"
-    emmake make install
+    cmake --build . -j"$NPROC"
+    cmake --install .
   )
 }
 
@@ -422,16 +516,22 @@ stage_zstd() {
     export CXXFLAGS="$CXXFLAGS -D_POSIX_SOURCE=1"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args zstd)
+      emcmake cmake -G "$CMAKE_GENERATOR" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         -DBUILD_SHARED_LIBS=OFF \
         -DZSTD_BUILD_SHARED=OFF \
         -DZSTD_BUILD_STATIC=ON \
         "$SOURCES_DIR/zstd/build/cmake"
+      save_cmake_probes zstd CMakeCache.txt
     fi
-    emmake make
-    emmake make install
+    if [[ "$CMAKE_GENERATOR" == "Ninja" ]]; then
+      cmake --build . -j"$NPROC"
+    else
+      cmake --build .
+    fi
+    cmake --install .
   )
 }
 
@@ -446,10 +546,15 @@ stage_libarchive() {
     export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib --use-port=zlib"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args libarchive)
+      # libarchive 3.6.1 defines both `archive` and `archive_static` outputting libarchive.a,
+      # which Ninja rejects at generate time; use Unix Makefiles and build them sequentially.
+      emcmake cmake -G "Unix Makefiles" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         -DCMAKE_PREFIX_PATH="$INSTALL_DIR" \
+        -DZSTD_INCLUDE_DIR="$INSTALL_DIR/include" \
+        -DZSTD_LIBRARY="$INSTALL_DIR/lib/libzstd.a" \
         -DBUILD_SHARED_LIBS=OFF \
         -DENABLE_TAR=OFF -DENABLE_TAR_SHARED=OFF \
         -DENABLE_CAT=OFF -DENABLE_CAT_SHARED=OFF \
@@ -460,9 +565,11 @@ stage_libarchive() {
         -DENABLE_LIBXML2=OFF -DENABLE_EXPAT=OFF \
         -DENABLE_ZSTD=ON -DENABLE_ZLIB=ON -DENABLE_TEST=OFF \
         "$BUILD_DIR/libarchive"
+      save_cmake_probes libarchive CMakeCache.txt
     fi
-    emmake make -j"$NPROC"
-    emmake make install
+    cmake --build . -j"$NPROC" --target archive
+    cmake --build . -j"$NPROC" --target archive_static
+    cmake --install .
   )
 }
 
@@ -472,13 +579,15 @@ stage_webshims() {
     cd "$BUILD_DIR/webshims-build"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args webshims)
+      emcmake cmake -G "$CMAKE_GENERATOR" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         "$SOURCES_DIR/webshims"
+      save_cmake_probes webshims CMakeCache.txt
     fi
-    emmake make -j"$NPROC"
-    emmake make install
+    cmake --build . -j"$NPROC"
+    cmake --install .
   )
 }
 
@@ -493,13 +602,15 @@ stage_libzip() {
     export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib --use-port=zlib"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args libzip)
+      emcmake cmake -G "$CMAKE_GENERATOR" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
         "$BUILD_DIR/libzip"
+      save_cmake_probes libzip CMakeCache.txt
     fi
-    emmake make -j"$NPROC"
-    emmake make install
+    cmake --build . -j"$NPROC"
+    cmake --install .
   )
 }
 
@@ -509,14 +620,21 @@ stage_luanti() {
     cd "$BUILD_DIR/luanti"
 
     local EMSDK_PORTS="--use-port=zlib --use-port=libjpeg --use-port=libpng --use-port=freetype --use-port=ogg --use-port=vorbis --use-port=sqlite3"
+    local EMSDK_COMPILE="-sUSE_SDL=2 $EMSDK_PORTS"
     local EMSDK_CANVAS="-sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sJSPI"
     local EMSDK_MODULE="-sINCOMING_MODULE_JS_API=mainScriptUrlOrBlob,canvas,monitorRunDependencies,preRun,postRun,print,printErr,setStatus,onFullScreen"
-    local EMSDK_EXTRA="-sUSE_SDL=2 $EMSDK_PORTS $EMSDK_CANVAS $EMSDK_MODULE"
+    local EMSDK_LINK="$EMSDK_COMPILE $EMSDK_CANVAS $EMSDK_MODULE -sPTHREAD_POOL_SIZE=22 -s EXPORTED_RUNTIME_METHODS=ccall,cwrap -s INITIAL_MEMORY=2013265920 -sMIN_WEBGL_VERSION=2 -sUSE_WEBGL2 -sWASMFS=1 -L$INSTALL_DIR/lib -larchive -lzstd -lemsocket -lwebsocket.js"
 
-    export CFLAGS="$CFLAGS $EMSDK_EXTRA"
-    export CXXFLAGS="$CXXFLAGS $EMSDK_EXTRA"
-    export LDFLAGS="$LDFLAGS $EMSDK_EXTRA -sPTHREAD_POOL_SIZE=22 -s EXPORTED_RUNTIME_METHODS=ccall,cwrap -s INITIAL_MEMORY=2013265920 -sMIN_WEBGL_VERSION=2 -sUSE_WEBGL2 -sWASMFS=1"
-    export LDFLAGS="$LDFLAGS -L$INSTALL_DIR/lib -larchive -lemsocket -lwebsocket.js"
+    export CFLAGS="$CFLAGS $EMSDK_COMPILE"
+    export CXXFLAGS="$CXXFLAGS $EMSDK_COMPILE"
+    export LDFLAGS="$LDFLAGS $EMSDK_COMPILE"
+
+    local LUANTI_LINKER_FLAG_VAR
+    if [[ "$LUANTI_BUILD_TYPE" == "Release" ]]; then
+      LUANTI_LINKER_FLAG_VAR="-DCMAKE_EXE_LINKER_FLAGS_RELEASE=$COMMON_LDFLAGS $EMSDK_LINK"
+    else
+      LUANTI_LINKER_FLAG_VAR="-DCMAKE_EXE_LINKER_FLAGS_DEBUG=$COMMON_LDFLAGS $EMSDK_LINK"
+    fi
 
     if [[ ! -f dummy.o ]]; then
       echo > dummy.c
@@ -527,8 +645,10 @@ stage_luanti() {
     local DUMMY_INCLUDE_DIR="$(pwd)/dummy_dir"
 
     if [[ ! -f CMakeCache.txt ]]; then
-      emcmake cmake \
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      local PROBE_ARGS=()
+      mapfile -t PROBE_ARGS < <(cmake_probe_args luanti)
+      emcmake cmake -G "$CMAKE_GENERATOR" ${PROBE_ARGS[@]+"${PROBE_ARGS[@]}"} "${CMAKE_COMMON_FLAGS[@]}" \
+        "$LUANTI_LINKER_FLAG_VAR" \
         -DCMAKE_VERBOSE_MAKEFILE=ON \
         -DENABLE_SYSTEM_GMP=OFF \
         -DENABLE_GETTEXT=TRUE \
@@ -539,7 +659,6 @@ stage_luanti() {
         -DPNG_LIBRARY="$DUMMY_OBJECT" \
         -DVORBISFILE_LIBRARY="$DUMMY_OBJECT" \
         -DSQLITE3_LIBRARY="$DUMMY_OBJECT" \
-        -DCMAKE_BUILD_TYPE="$LUANTI_BUILD_TYPE" \
         -DOPENGLES2_INCLUDE_DIR="$DUMMY_INCLUDE_DIR" \
         -DOPENGLES2_LIBRARY="$DUMMY_OBJECT" \
         -DZSTD_LIBRARY="$INSTALL_DIR/lib/libzstd.a" \
@@ -549,12 +668,13 @@ stage_luanti() {
         -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/luanti-install" \
         -DLIBZIP_LIBRARY="$INSTALL_DIR/lib/libzip.a" \
         -DLIBZIP_INCLUDE_DIR="$INSTALL_DIR/include" \
-        -G "Unix Makefiles" \
         "$SOURCES_DIR/luanti"
+      save_cmake_probes luanti CMakeCache.txt
     fi
 
     rm -rf "$BUILD_DIR/luanti-install"
-    emmake make -j"$NPROC" install
+    cmake --build . -j"$NPROC"
+    cmake --install .
   )
 }
 
@@ -584,8 +704,10 @@ EOF
     rm -f fsroot.tar certs.tar fsroot.tar.zst certs.tar.zst
     tar cf fsroot.tar -C fsroot .
     tar cf certs.tar -C certsroot .
-    zstd -f -T0 --ultra -22 fsroot.tar
-    zstd -f -T0 --ultra -22 certs.tar
+    # shellcheck disable=SC2086
+    zstd -f -T0 $ZSTD_OPTS fsroot.tar
+    # shellcheck disable=SC2086
+    zstd -f -T0 $ZSTD_OPTS certs.tar
   )
 }
 
@@ -633,13 +755,14 @@ stage_www() {
     sed "s/%__RELEASE_UUID__%/$RELEASE_UUID/g" "$BASE_DIR/static/$1" > "$2"
   }
 
-  apply_substitutions htaccess_toplevel "$WWW_DIR/.htaccess"
-  apply_substitutions index.html        "$WWW_DIR/index.html"
-  apply_substitutions htaccess_release  "$RELEASE_DIR/.htaccess"
-  apply_substitutions launcher.js       "$RELEASE_DIR/launcher.js"
-  apply_substitutions worker.js         "$RELEASE_DIR/worker.js"
-  apply_substitutions lockworker.js     "$RELEASE_DIR/lockworker.js"
-  apply_substitutions htaccess_packs    "$PACKS_DIR/.htaccess"
+  apply_substitutions htaccess_toplevel     "$WWW_DIR/.htaccess"
+  apply_substitutions index.html            "$WWW_DIR/index.html"
+  apply_substitutions coi-serviceworker.js  "$WWW_DIR/coi-serviceworker.js"
+  apply_substitutions htaccess_release      "$RELEASE_DIR/.htaccess"
+  apply_substitutions launcher.js           "$RELEASE_DIR/launcher.js"
+  apply_substitutions worker.js             "$RELEASE_DIR/worker.js"
+  apply_substitutions lockworker.js         "$RELEASE_DIR/lockworker.js"
+  apply_substitutions htaccess_packs        "$PACKS_DIR/.htaccess"
 
   cp -a "$SOURCES_DIR/xterm" "$RELEASE_DIR/xterm"
   cp "$BUILD_DIR/fsroot.tar.zst" "$PACKS_DIR/base.pack"
